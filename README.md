@@ -1,58 +1,78 @@
-***
-
 # Kits Kärneriks: Breaking the Glass on Client-Side Fraud Defense
 
-## 1. The Setup
+## 1. The Objective
 
-I spent the better part of 2021 tearing apart the invisible force field that guards Google’s login infrastructure. The target was "Botguard," a piece of defensive engineering that sits quietly in the browser and decides if you are a human or a script. This wasn't an academic exercise in parsing HTML; I wanted to know if I could forge the digital passport required to enter the ecosystem. The result was a proof-of-concept that bypassed the checks completely by outsourcing the heavy lifting to a hardened, headless browser. We proved that even the most sophisticated client-side validation crumbles when you control the environment it runs in.
+This repository chronicles a dual-pronged assault on Google’s login infrastructure. The primary target is "Botguard," a defensive mechanism often dismissed as a simple fingerprinting script. It is not. It is a hostile, obfuscated Virtual Machine (VM) running directly in the client’s browser.
 
-> 🚨 **Updated Context & Disclaimer** 🚨
+In 2021, we proved this system could be bypassed. We did not do this by untangling the knot; we cut it. By utilizing a hardened headless browser, we generated valid security tokens on the legitimate domain and trafficked them to a Man-in-the-Middle (MITM) phishing context. This document details the architectural flaws of that client-side trust model and integrates a deep-dive reverse engineering analysis of the VM internals that make Botguard such a formidable adversary.
+
+> 🚨 **Operational Note** 🚨
 >
-> This analysis was conducted in 2021 on Google's v2 login flow. While Google rolled out a v3 login page in 2022, this update was largely a "facelift."
->
-> The fundamental flaw discussed here—namely, Botguard tokens not being tied to a browser session—persisted in the v3 flow. The changes were minor, such as renaming the request parameter used to send the token. Consequently, the core principles of this analysis remain relevant for understanding the vulnerability, even if specific implementation details have changed. This content is for educational and research purposes only.
+> The architectural analysis here applies to the core Botguard VM logic found in ReCaptcha v2 and Google's v2/v3 login flows. While specific variable names shift with every compile, the underlying "CPU-in-JavaScript" logic remains the engine of their defense.
 
+## 2. The Defense: It's Not a Script, It's a CPU
 
-## 2. Dissecting Botguard
+To defeat the enemy, you must understand its biology. Botguard is not a static list of checks. It is a custom, register-based Virtual Machine written in JavaScript.
 
-#### Purpose: Anti-Fraud and Anti-Phishing, Not Just Anti-Bot
+When the browser loads the login page, it doesn't just run code; it boots a processor. This VM executes a custom bytecode binary. This is the heavy armor. It beats standard Control Flow Flattening (CFF) because you cannot simply beautify the code to read it. You must write a disassembler, a decompiler, and a custom debugger just to see the instructions.
 
-While its name implies a generic "anti-bot" function, Botguard's primary purpose is more specific: **anti-fraud**. It is not merely designed to stop web scraping but to thwart automated attacks that lead to account takeover (ATO), such as credential stuffing, password spraying, and, most relevant to this research, **validating credentials at scale from a phishing proxy**.
+### The Virtual Machine Architecture
 
-A successful MITM phishing tool like Evilginx must not only look like the target site but also behave like it from the server's perspective. When a user enters their credentials into the phishing page, the tool proxies that request to the real service. Botguard's role is to ensure the environment where the credentials were entered was a legitimate, non-automated, human-driven browser session, thus invalidating the proxied request from the phishing server.
+The VM emulates a modern CPU. It uses registers to hold variables and operational states. While older obfuscators might use stack-based logic (like Java or WASM), Botguard uses a register-based approach that mimics the x86 architecture sitting in your actual hardware.
 
-#### How It Functions: Client-Side Environmental Fingerprinting
+The initialization sequence is frantic. It locates its own bytecode string, grabs a substring (often the first three characters + an underscore), and uses that dynamic key to locate the initialization function. This prevents static analysis tools from easily finding the entry point. Once the VM boots, it begins executing opcodes.
 
-It works by executing a massive suite of obfuscated JavaScript that fingerprint the client. It measures everything: the specific rendering quirks of your fonts, the microscopic jitter in your mouse movements, the dimensions of your screen, and the timing of your keystrokes. It bundles this chaos into a fingerprint and mints a security token.
+### The Opcodes
 
-This data is processed through a proprietary algorithm to generate a security token. This token essentially serves as the browser's "attestation" that the session is legitimate. The token is then sent as a `bgRequest` parameter with the account lookup request. If the token is missing, malformed, or decodes to a fingerprint that flags the session as "high-risk" or "automated," Google's servers reject the login attempt with the generic "Couldn't sign you in" error, providing no information to the attacker.
+We identified the instruction set through painful trial and error. The VM utilizes a mix of standard logic and custom operations:
 
+* **`328 (USHR) / 381 (ADD)`:** Standard bitwise and arithmetic operations.
+* **`65 (SETPROP) / 467 (GETPROP)`:** Manipulation of object properties, used to bind the anti-tamper mechanisms to the DOM.
+* **`220 (IN)`:** Checks for the existence of properties, likely looking for `webdriver` flags.
+* **`289 (HALT)`:** Kills the execution if an anomaly is detected.
 
-#### Drawbacks and Limitations
+The most dangerous aspect is **Self-Modifying Code**. The VM brings in new opcodes at runtime. It constructs an array of integers (Register 274) and maps them to string definitions, using a `LOADSTRING` opcode to generate new instructions on the fly. An `EVAL` opcode (mapped as `LOADOP`) then compiles these into executable logic. The code you see at the start is not the code that runs at the end.
 
-The weakness here is obvious if you stop thinking like a defender. The system relies entirely on code executing on the client's machine. If I control the machine, I control the reality that the code perceives. The check is domain-specific, meaning it fails on a phishing site, but the token itself is just a string of characters. If I could generate that string on a legitimate domain and smuggle it out, the server wouldn't know the difference.
+## 3. Anti-Tamper Mechanisms
 
-## 3. The Heist
+Botguard actively fights back against analysis. It assumes it is being watched.
 
-I started by watching my own attacks fail. My Man-in-the-Middle (MITM) proxy was getting rejected every time it tried to forward a login request. I traced the failure to a single parameter: bgRequest. This was the token. My proxy couldn't generate a valid one because it wasn't google.com.
+### Chronometric Defense (Anti-Debug)
 
-#### The Breakthrough: Isolating the `bgRequest` Token
+The script is obsessed with time. It constantly polls `performance.now()` combined with `Date.now()`. If you set a breakpoint in DevTools, the execution pauses, but the clock keeps ticking. When you resume, the delta between timestamps is massive.
 
-Through methodical network analysis and request replay (using tools like Burp Suite), it was discovered that the single differentiating factor was the value of the `bgRequest` parameter. A token generated on the phishing domain was invalid, while one generated on `google.com` was valid.
+The VM uses this delta to mutate a **Seed** (stored in the VM context `K.U`). The seed determines the decryption key for the next block of bytecode. If the time delta suggests a debugger was active, the seed corrupts. The program doesn't crash immediately; it silently diverges into a garbage execution path, generating an invalid token that the server will reject. You think you are debugging it, but you are ghost-hunting in a dead timeline.
 
+### The Anti-Logger
 
-This led to the core hypothesis: **the server-side validation is primarily concerned with the integrity of the submitted token, not the immediate origin of the request itself.**
+You cannot print the variables. The script aggressively binds to console methods. It creates a trap function that overrides properties using a `create` (or similar) method. If you attempt to inject a `console.log` or use a conditional logpoint, the trap triggers.
 
-#### The Proof-of-Concept: Decoupled Token Generation
+This trap modifies the `t.prototype` stack, which is linked to the memory reader function. By logging a variable, you inadvertently shift the memory pointer. The VM reads the wrong bytes, the instruction stream corrupts, and the session dies.
 
-The solution was to build a token factory. I didn't try to reverse-engineer the obfuscated JavaScript because that is a losing battle against a team of Google engineers. Instead, I simply gave the script exactly what it wanted. I used go-rod, a browser automation framework, to spin up a headless Chrome instance. Naked automation gets flagged instantly, so I wrapped it in stealth libraries to patch the webdriver leaks and mask the user agent.
+## 4. The Bypass: Environmental Spoofing
 
+Given the complexity of the VM—self-modifying opcodes, rolling encryption keys, and time-based seed mutation—pure reverse engineering is a high-cost attrition war. The most efficient attack vector is not to break the lock but to steal the key.
 
-This "puppet" browser navigated to the real accounts.google.com. To Botguard, this looked like a legitimate user on a legitimate site. The script ran, did its biometric checks, and minted a pristine, valid token. I set up an interceptor to snatch that token the millisecond it was generated, killed the network request so it wouldn't be used, and exported the string.
+### The "Puppet" Strategy
 
+The server-side validation checks the token's integrity, not its origin. The token proves that *a* browser passed the checks. It does not prove *which* user is holding the token.
 
-I then fed this stolen ID card into my phishing proxy. When the proxy sent the login request to Google, it attached the valid token I had just manufactured in the clean environment. The server validated the token, saw it was legitimate, and authorized the session. We bypassed the entire fraud detection suite by simply decoupling the generation of the token from its usage.
+We deployed **go-rod**, a Golang-based browser automation framework, to act as the token factory.
 
+1. **Stealth Layer:** Standard headless Chrome leaks its identity (e.g., `navigator.webdriver = true`). We patched this using stealth libraries to mask the user agent, override prototype methods, and spoof WebGL rendering contexts.
+2. **Token Extraction:** The automated browser navigates to `accounts.google.com`. It inputs a target email. Botguard runs, validates the environment, and mints the `bgRequest` token.
+3. **Interception:** We hook the request on the client side immediately after generation. We abort the network call to Google (preventing the token from being "spent") and extract the string.
+4. **Injection:** This fresh, valid token is passed to our MITM proxy. The proxy attaches it to the victim's request. Google's server sees a valid token from a "clean" browser and authorizes the phishing session.
+
+This method bypasses the VM entirely. We do not care about the opcodes or the registers because we are giving the VM exactly what it wants: a compliant browser environment.
+
+## 5. The Reality Check
+
+* **Client-Side Checks are Vulnerable to Environmental Spoofing:** While powerful, client-side defenses are fundamentally running on an attacker-controlled machine. With sufficient effort, the environment can be mimicked to satisfy the checks. The use of stealth plugins is a clear example of this.
+* **Token Portability is a Potential Weakness:** The security of token-based systems like Botguard relies on the token being non-transferable. This research shows that if token generation can be outsourced to a "clean" environment, the token can then be used in a "dirty" one, defeating the purpose of the check.
+* **The Importance of a Layered Defense:** This bypass works because it circumvents a single, albeit strong, layer of defense. More advanced defensive systems could correlate the token's fingerprint with other server-side signals (e.g., IP address reputation, historical session data) to detect this type of anomaly.
+
+The industry creates these elaborate cat-and-mouse games, adding layers of obfuscation and behavioral analysis. Yet, as long as the logic relies on a token that can be ported from a clean environment to a dirty one, the defense is bypassable. It isn't about breaking the encryption; it is about abusing the architecture.
 
 <table>
   <tr>
@@ -61,14 +81,18 @@ I then fed this stolen ID card into my phishing proxy. When the proxy sent the l
   </tr>
 </table>
 
-## 4. The Reality Check
+## 6. Technical Findings: The Memory Reader
 
-*   **Client-Side Checks are Vulnerable to Environmental Spoofing:** While powerful, client-side defenses are fundamentally running on an attacker-controlled machine. With sufficient effort, the environment can be mimicked to satisfy the checks. The use of stealth plugins is a clear example of this.
-*   **Token Portability is a Potential Weakness:** The security of token-based systems like Botguard relies on the token being non-transferable. This research shows that if token generation can be outsourced to a "clean" environment, the token can then be used in a "dirty" one, defeating the purpose of the check.
-*   **The Importance of a Layered Defense:** This bypass works because it circumvents a single, albeit strong, layer of defense. More advanced defensive systems could correlate the token's fingerprint with other server-side signals (e.g., IP address reputation, historical session data) to detect this type of anomaly.
+For those intent on the pure reverse-engineering path, the heart of the beast is the memory reader function, often minified as `H`.
 
-The industry creates these elaborate cat-and-mouse games, adding layers of obfuscation and behavioral analysis. Yet, as long as the logic relies on a token that can be ported from a clean environment to a dirty one, the defense is bypassable. It isn't about breaking the encryption; it is about abusing the architecture.
+It reads bytes from the bytecode array but encrypts them before return.
 
-## 5. Contact
+* **Register 21:** Acts as a rolling key array.
+* **`Z.W`:** A position tracker that increments linearly.
+* **`Z.U`:** The seed, which mutates based on time and execution history.
+
+The function `H(true, L, 8)` reads 8 bits. If the first argument is true, it calls an encryption routine using Register 21. A `SETPROP` opcode exists specifically to scramble these keys, resetting the position and pulling a new seed from the reader. This circular dependency (the reader relies on the seed, the seed relies on the reader) makes static analysis nearly impossible without perfect emulation.
+
+## 7. Contact
 
 I break things to understand how to build them better. I am looking for roles where I can apply this offensive mindset to defensive strategies. If you want to discuss web security, reverse engineering, or why client-side trust is a myth, reach out. Find me on LinkedIn.
